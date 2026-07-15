@@ -68,25 +68,87 @@ const store = {
   },
 };
 
-// comprime foto para não estourar o limite de armazenamento
-function comprimirFoto(file) {
+// comprime e CARIMBA a foto: logo + data/hora + coordenadas UTM + descrição
+const lerArquivo = (file) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+
+// conversão lat/lon (WGS84) → UTM, formato "22K 777925 7646586"
+function toUTM(lat, lon) {
+  const a = 6378137, f = 1 / 298.257223563, k0 = 0.9996;
+  const e2 = f * (2 - f), ep2 = e2 / (1 - e2);
+  const zone = Math.floor((lon + 180) / 6) + 1;
+  const lam0 = ((zone - 1) * 6 - 180 + 3) * Math.PI / 180;
+  const phi = lat * Math.PI / 180, lam = lon * Math.PI / 180;
+  const N = a / Math.sqrt(1 - e2 * Math.sin(phi) ** 2);
+  const T = Math.tan(phi) ** 2, Cc = ep2 * Math.cos(phi) ** 2;
+  const A = Math.cos(phi) * (lam - lam0);
+  const M = a * ((1 - e2 / 4 - 3 * e2 * e2 / 64 - 5 * e2 ** 3 / 256) * phi
+    - (3 * e2 / 8 + 3 * e2 * e2 / 32 + 45 * e2 ** 3 / 1024) * Math.sin(2 * phi)
+    + (15 * e2 * e2 / 256 + 45 * e2 ** 3 / 1024) * Math.sin(4 * phi)
+    - (35 * e2 ** 3 / 3072) * Math.sin(6 * phi));
+  const E = k0 * N * (A + (1 - T + Cc) * A ** 3 / 6 + (5 - 18 * T + T * T + 72 * Cc - 58 * ep2) * A ** 5 / 120) + 500000;
+  let Nn = k0 * (M + N * Math.tan(phi) * (A * A / 2 + (5 - T + 9 * Cc + 4 * Cc * Cc) * A ** 4 / 24 + (61 - 58 * T + T * T + 600 * Cc - 330 * ep2) * A ** 6 / 720));
+  if (lat < 0) Nn += 10000000;
+  const letter = "CDEFGHJKLMNPQRSTUVWX"[Math.floor((lat + 80) / 8)] || "";
+  return `${zone}${letter} ${Math.round(E)} ${Math.round(Nn)}`;
+}
+
+function pegarPosicaoUTM() {
   return new Promise((res) => {
-    const r = new FileReader();
-    r.onload = () => {
-      const img = new window.Image();
-      img.onload = () => {
-        const max = 750;
-        const sc = Math.min(1, max / Math.max(img.width, img.height));
-        const cv = document.createElement("canvas");
-        cv.width = Math.round(img.width * sc);
-        cv.height = Math.round(img.height * sc);
-        cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
-        res(cv.toDataURL("image/jpeg", 0.6));
-      };
-      img.onerror = () => res(r.result);
-      img.src = r.result;
+    if (!navigator.geolocation) return res(null);
+    navigator.geolocation.getCurrentPosition(
+      (p) => res(toUTM(p.coords.latitude, p.coords.longitude)),
+      () => res(null),
+      { enableHighAccuracy: true, timeout: 7000, maximumAge: 60000 }
+    );
+  });
+}
+
+let logoImgCache = null;
+const getLogoImg = () => new Promise((res) => {
+  if (logoImgCache) return res(logoImgCache);
+  const im = new window.Image();
+  im.onload = () => { logoImgCache = im; res(im); };
+  im.onerror = () => res(null);
+  im.src = LOGO;
+});
+
+async function carimbarFoto(file, tag) {
+  const [dataUrl, utm, logo] = await Promise.all([lerArquivo(file), pegarPosicaoUTM(), getLogoImg()]);
+  return new Promise((res) => {
+    const img = new window.Image();
+    img.onload = () => {
+      const max = 1050;
+      const sc = Math.min(1, max / Math.max(img.width, img.height));
+      const w = Math.round(img.width * sc), h = Math.round(img.height * sc);
+      const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+      const ctx = cv.getContext("2d");
+      ctx.drawImage(img, 0, 0, w, h);
+      // logo no topo direito (com fundo branco arredondado próprio da arte)
+      if (logo) {
+        const lw = Math.round(w * 0.23), lh = Math.round(lw * (logo.height / logo.width));
+        ctx.save();
+        ctx.shadowColor = "rgba(0,0,0,0.4)"; ctx.shadowBlur = 10; ctx.shadowOffsetY = 2;
+        ctx.drawImage(logo, w - lw - Math.round(w * 0.022), Math.round(w * 0.022), lw, lh);
+        ctx.restore();
+      }
+      // carimbo de texto no rodapé direito
+      const agora = new Date();
+      const dataTxt = `${agora.toLocaleDateString("pt-BR", { day: "numeric", month: "long", year: "numeric" })} às ${agora.toLocaleTimeString("pt-BR")}`;
+      const linhas = [dataTxt];
+      if (utm) linhas.push(utm);
+      if (tag && tag.trim()) linhas.push(tag.trim());
+      const fs = Math.max(18, Math.round(w * 0.042));
+      ctx.font = `600 ${fs}px Arial, Helvetica, sans-serif`;
+      ctx.textAlign = "right";
+      ctx.fillStyle = "#FFFFFF";
+      ctx.shadowColor = "rgba(0,0,0,0.85)"; ctx.shadowBlur = Math.round(fs * 0.38); ctx.shadowOffsetY = 1;
+      linhas.forEach((l, i) => {
+        ctx.fillText(l, w - Math.round(fs * 0.6), h - Math.round(fs * 0.6) - (linhas.length - 1 - i) * Math.round(fs * 1.28));
+      });
+      res(cv.toDataURL("image/jpeg", 0.7));
     };
-    r.readAsDataURL(file);
+    img.onerror = () => res(dataUrl);
+    img.src = dataUrl;
   });
 }
 
@@ -154,10 +216,10 @@ export default function App() {
 
   const [dia, setDia] = useState({
     obra: "", usina: "", fiscal: "", coordenador: "", data: hoje,
-    capTipo: "CAP 50/70", faixa: "C", teorProjeto: "",
+    capTipo: "CAP 50/70", faixa: "C", teorProjeto: "", fotoTag: "",
   });
   const [granProj, setGranProj] = useState(Object.fromEntries(PENEIRAS.map((p) => [p.id, ""])));
-  const [lab, setLab] = useState({ teorMedido: "", metodo: "Rotarex (DNER-ME 053)", gran: Object.fromEntries(PENEIRAS.map((p) => [p.id, ""])) });
+  const [lab, setLab] = useState({ teorMedido: "", metodo: "Rotarex (DNER-ME 053)", gran: Object.fromEntries(PENEIRAS.map((p) => [p.id, ""])), fotosTeor: [], fotosGran: [] });
   const [cargas, setCargas] = useState([]);
   const [nova, setNova] = useState({ placa: "", destino: "", temp: "", ton: "", obs: "", fotos: [] });
   const [obsDia, setObsDia] = useState("");
@@ -205,6 +267,42 @@ export default function App() {
     setVendoHistorico(null);
   };
 
+  // ── SALVAMENTO AUTOMÁTICO: restaura ao abrir e grava a cada alteração ──
+  const carregouRef = useRef(false);
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await store.get("dia-atual");
+        if (raw) {
+          const s = JSON.parse(raw);
+          if (s.dia) setDia(s.dia);
+          if (s.lab) setLab(s.lab);
+          if (s.granProj) setGranProj(s.granProj);
+          if (Array.isArray(s.cargas)) setCargas(s.cargas);
+          if (s.obsDia) setObsDia(s.obsDia);
+        }
+      } catch {}
+      carregouRef.current = true;
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!carregouRef.current || vendoHistorico) return; // não sobrescreve o dia atual enquanto vê histórico
+    const t = setTimeout(() => {
+      store.set("dia-atual", JSON.stringify({ dia, lab, granProj, cargas, obsDia })).catch(() => {});
+    }, 500);
+    return () => clearTimeout(t);
+  }, [dia, lab, granProj, cargas, obsDia, vendoHistorico]);
+
+  // ── iniciar um novo dia de trabalho (mantém obra/usina/nomes/traço) ──
+  const novoDia = () => {
+    if (cargas.length && !window.confirm("Iniciar novo dia? As cargas e ensaios atuais serão limpos.\n\nSe ainda não arquivou o relatório de hoje, cancele e toque em '💾 Arquivar dia' primeiro.")) return;
+    setCargas([]); setObsDia("");
+    setLab((s) => ({ ...s, teorMedido: "", gran: Object.fromEntries(PENEIRAS.map((p) => [p.id, ""])) }));
+    setDia((s) => ({ ...s, data: new Date().toISOString().slice(0, 10) }));
+    setRelTipo("diario");
+  };
+
   const setD = (k, v) => setDia((s) => ({ ...s, [k]: v }));
   const faixa = dia.faixa;
   const peneirasF = ordemFaixa(faixa);
@@ -212,11 +310,42 @@ export default function App() {
   // ── fotos da nova carga ──
   const onFotos = (e) => {
     Array.from(e.target.files || []).forEach(async (f) => {
-      const url = await comprimirFoto(f);
+      const url = await carimbarFoto(f, dia.fotoTag);
       setNova((s) => ({ ...s, fotos: [...s.fotos, { url, legenda: "", hora: new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) }] }));
     });
     e.target.value = "";
   };
+
+  // ── fotos dos ensaios de laboratório ──
+  const fileTeorRef = useRef(null);
+  const fileGranRef = useRef(null);
+  const onFotosLab = (campo) => (e) => {
+    Array.from(e.target.files || []).forEach(async (f) => {
+      const url = await carimbarFoto(f, dia.fotoTag);
+      setLab((s) => ({ ...s, [campo]: [...(s[campo] || []), { url, hora: new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) }] }));
+    });
+    e.target.value = "";
+  };
+  const rmFotoLab = (campo, i) => setLab((s) => ({ ...s, [campo]: (s[campo] || []).filter((_, j) => j !== i) }));
+
+  const FotosLab = ({ campo, refInput }) => (
+    <div>
+      <input ref={refInput} type="file" accept="image/*" capture="environment" multiple onChange={onFotosLab(campo)} style={{ display: "none" }} />
+      <button onClick={() => refInput.current?.click()} style={{ width: "100%", marginTop: 10, padding: 11, border: `2px dashed ${C.navy}`, borderRadius: 8, background: "#F7F8FC", cursor: "pointer", fontFamily: F.display, fontWeight: 700, fontSize: 12.5, textTransform: "uppercase", color: C.navy }}>
+        📷 Foto do ensaio ({(lab[campo] || []).length})
+      </button>
+      {(lab[campo] || []).length > 0 && (
+        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+          {(lab[campo] || []).map((f, i) => (
+            <div key={i} style={{ position: "relative" }}>
+              <img src={f.url} alt="" style={{ width: 74, height: 74, objectFit: "cover", borderRadius: 8, border: `1px solid ${C.linha}` }} />
+              <button onClick={() => rmFotoLab(campo, i)} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, borderRadius: 10, border: "none", background: C.nok, color: "#fff", fontSize: 11, cursor: "pointer", lineHeight: 1 }}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 
   const addCarga = () => {
     if (num(nova.temp) === null) { alert("Informe a temperatura da massa."); return; }
@@ -339,20 +468,24 @@ export default function App() {
               </select>
             </Field>
             <Field label="Teor de projeto (%)"><input type="number" step="0.1" inputMode="decimal" style={inp} value={dia.teorProjeto} onChange={(e) => setD("teorProjeto", e.target.value)} placeholder="Ex.: 5.0" /></Field>
+            <Field label="Carimbo das fotos (usina / descrição)"><input style={inp} value={dia.fotoTag} onChange={(e) => setD("fotoTag", e.target.value)} placeholder="Ex.: #USINA AUTEM" /></Field>
           </div>
 
           <Sec>Ensaio — Teor de ligante</Sec>
-          <div style={{ background: "#fff", border: `1.5px solid ${okTeor === false ? C.nok : C.linha}`, borderRadius: 10, padding: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, alignItems: "end" }}>
-            <Field label="Teor medido (%)"><input type="number" step="0.01" inputMode="decimal" style={inp} value={lab.teorMedido} onChange={(e) => setLab((s) => ({ ...s, teorMedido: e.target.value }))} placeholder="Ex.: 5.08" /></Field>
-            <Field label="Método">
-              <select style={inp} value={lab.metodo} onChange={(e) => setLab((s) => ({ ...s, metodo: e.target.value }))}>
-                <option>Rotarex (DNER-ME 053)</option><option>Ignição (NBR 16972)</option><option>Refluxo / Soxhlet</option>
-              </select>
-            </Field>
-            <div style={{ paddingBottom: 4 }}>
-              <div style={{ fontFamily: F.mono, fontSize: 11.5, color: C.sub, marginBottom: 6 }}>Tolerância ±0,3% · Desvio: {num(dia.teorProjeto) !== null && num(lab.teorMedido) !== null ? `${num(lab.teorMedido) - num(dia.teorProjeto) >= 0 ? "+" : ""}${fmt(num(lab.teorMedido) - num(dia.teorProjeto), 2)}%` : "—"}</div>
-              <Chip ok={okTeor} />
+          <div style={{ background: "#fff", border: `1.5px solid ${okTeor === false ? C.nok : C.linha}`, borderRadius: 10, padding: 14 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, alignItems: "end" }}>
+              <Field label="Teor medido (%)"><input type="number" step="0.01" inputMode="decimal" style={inp} value={lab.teorMedido} onChange={(e) => setLab((s) => ({ ...s, teorMedido: e.target.value }))} placeholder="Ex.: 5.08" /></Field>
+              <Field label="Método">
+                <select style={inp} value={lab.metodo} onChange={(e) => setLab((s) => ({ ...s, metodo: e.target.value }))}>
+                  <option>Rotarex (DNER-ME 053)</option><option>Ignição (NBR 16972)</option><option>Refluxo / Soxhlet</option>
+                </select>
+              </Field>
+              <div style={{ paddingBottom: 4 }}>
+                <div style={{ fontFamily: F.mono, fontSize: 11.5, color: C.sub, marginBottom: 6 }}>Tolerância ±0,3% · Desvio: {num(dia.teorProjeto) !== null && num(lab.teorMedido) !== null ? `${num(lab.teorMedido) - num(dia.teorProjeto) >= 0 ? "+" : ""}${fmt(num(lab.teorMedido) - num(dia.teorProjeto), 2)}%` : "—"}</div>
+                <Chip ok={okTeor} />
+              </div>
             </div>
+            <FotosLab campo="fotosTeor" refInput={fileTeorRef} />
           </div>
 
           <Sec>Ensaio — Granulometria (Faixa {faixa})</Sec>
@@ -378,11 +511,16 @@ export default function App() {
               </tbody>
             </table>
           </div>
+          <FotosLab campo="fotosGran" refInput={fileGranRef} />
 
           <Sec>Observações do dia</Sec>
           <textarea rows={3} style={{ ...inp, fontFamily: F.body, resize: "vertical" }} value={obsDia} onChange={(e) => setObsDia(e.target.value)} placeholder="Clima, ajustes na usina, ocorrências, visitas..." />
 
           <button onClick={() => setAba("cargas")} style={{ ...btn(C.navy), width: "100%", marginTop: 24, padding: 15, fontSize: 15 }}>Ir para lançamento de cargas →</button>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 12, gap: 10, flexWrap: "wrap" }}>
+            <span style={{ fontFamily: F.mono, fontSize: 11, color: C.ok }}>💾 Salvamento automático ativo — pode fechar o app sem medo</span>
+            <button onClick={novoDia} style={{ ...btn("transparent", C.nok), border: `1.5px solid ${C.nok}`, padding: "8px 14px", fontSize: 11 }}>🧹 Iniciar novo dia</button>
+          </div>
         </main>
       )}
 
@@ -586,6 +724,23 @@ export default function App() {
                     })}
                   </tbody>
                 </table>
+
+                {((lab.fotosTeor || []).length > 0 || (lab.fotosGran || []).length > 0) && (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 8, marginTop: 8 }}>
+                    {(lab.fotosTeor || []).map((f, i) => (
+                      <figure key={`t${i}`} style={{ margin: 0, border: `1px solid ${C.linha}`, borderRadius: 6, overflow: "hidden" }}>
+                        <img src={f.url} alt="" style={{ width: "100%", height: 105, objectFit: "cover", display: "block" }} />
+                        <figcaption style={{ fontFamily: F.mono, fontSize: 8.5, padding: "4px 7px", color: C.sub }}>Ensaio teor de ligante · {f.hora}</figcaption>
+                      </figure>
+                    ))}
+                    {(lab.fotosGran || []).map((f, i) => (
+                      <figure key={`g${i}`} style={{ margin: 0, border: `1px solid ${C.linha}`, borderRadius: 6, overflow: "hidden" }}>
+                        <img src={f.url} alt="" style={{ width: "100%", height: 105, objectFit: "cover", display: "block" }} />
+                        <figcaption style={{ fontFamily: F.mono, fontSize: 8.5, padding: "4px 7px", color: C.sub }}>Ensaio granulometria · {f.hora}</figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                )}
 
                 <div style={secRel}>4 · Análise técnica</div>
                 <div style={{ border: `1px solid ${C.linha}`, borderRadius: 6, padding: "10px 12px", fontFamily: F.body, fontSize: 11.5, lineHeight: 1.55 }}>
