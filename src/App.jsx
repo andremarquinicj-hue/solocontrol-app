@@ -1064,6 +1064,7 @@ function CoordObras({ perfil }) {
   const [f, setF] = useState({ nome: "", contratante: "", local: "", espessuraProjeto: "", faixa: "", freqTon: "", freqCargas: "" });
   const [msg, setMsg] = useState("");
   const [resumo, setResumo] = useState(null);
+  const [aplic, setAplic] = useState(null);
   const m = (k) => (e) => setF({ ...f, [k]: e.target.value });
 
   const criar = () => {
@@ -1079,6 +1080,13 @@ function CoordObras({ perfil }) {
   const concluir = async (o) => {
     if (!confirm(`Concluir a obra "${o.nome}"? Ela sai da lista dos técnicos e o resumo geral fica disponível.`)) return;
     await updateDoc(doc(db, "obras", o.id), { status: "concluida", dataConclusao: hojeISO() });
+  };
+  const abrirDados = async (o, alvo) => {
+    const [cs, fs] = await Promise.all([
+      getDocs(query(collection(db, "cargas"), where("obraId", "==", o.id))),
+      getDocs(query(collection(db, "fechamentos"), where("obraId", "==", o.id))),
+    ]);
+    alvo({ obra: o, cargas: cs.docs.map((d) => ({ id: d.id, ...d.data() })), fechs: fs.docs.map((d) => ({ id: d.id, ...d.data() })) });
   };
   const abrirResumo = async (o) => {
     const [cs, fs] = await Promise.all([
@@ -1121,6 +1129,7 @@ function CoordObras({ perfil }) {
           {o.espessuraProjeto && <Linha k="Projeto" v={`${o.espessuraProjeto} cm ${o.faixa ? `· ${o.faixa}` : ""}`} />}
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
             <Btn tom="claro" cheio={false} onClick={() => abrirResumo(o)} style={{ flex: 1, padding: "10px" }}>📄 Resumo geral</Btn>
+            <Btn cheio={false} onClick={() => abrirDados(o, setAplic)} style={{ flex: 1, padding: "10px" }}>📐 Relatório de aplicação</Btn>
             {o.status === "ativa"
               ? <Btn tom="red" cheio={false} onClick={() => concluir(o)} style={{ flex: 1, padding: "10px" }}>🏁 Concluir obra</Btn>
               : <Btn tom="claro" cheio={false} onClick={() => updateDoc(doc(db, "obras", o.id), { status: "ativa", dataConclusao: "" })} style={{ flex: 1, padding: "10px" }}>Reativar</Btn>}
@@ -1128,6 +1137,7 @@ function CoordObras({ perfil }) {
         </Cartao>
       ))}
       {resumo && <ResumoObra {...resumo} fechar={() => setResumo(null)} />}
+      {aplic && <RelatorioAplicacao {...aplic} fechar={() => setAplic(null)} />}
     </>
   );
 }
@@ -2796,7 +2806,7 @@ function RelatorioPorLink({ tipo, obraId, data }) {
         const obra = { id: os.id, ...os.data() };
         if (tipo === "carta") return setD({ obra });
         if (tipo === "campo") return setD({ obra });
-        if (tipo === "resumo") {
+        if (tipo === "resumo" || tipo === "aplicacao") {
           const [cs, fs] = await Promise.all([
             getDocs(query(collection(db, "cargas"), where("obraId", "==", obraId))),
             getDocs(query(collection(db, "fechamentos"), where("obraId", "==", obraId))),
@@ -2830,7 +2840,234 @@ function RelatorioPorLink({ tipo, obraId, data }) {
   const voltar = () => { window.location.href = location.origin; };
   if (tipo === "carta") return <CartaControle obra={d.obra} fechar={voltar} estatico />;
   if (tipo === "campo") return <FormulariosCampo obra={d.obra} dataRef={data} fechar={voltar} estatico />;
+  if (tipo === "aplicacao") return <RelatorioAplicacao obra={d.obra} cargas={d.cargas} fechs={d.fechs} fechar={voltar} estatico />;
   if (tipo === "resumo") return <ResumoObra obra={d.obra} cargas={d.cargas} fechs={d.fechs} fechar={voltar} estatico />;
   if (tipo === "usina") return <RelatorioUsina obra={d.obra} dataRef={data} cargas={d.cargas} ensaios={d.ensaios} projeto={d.projeto} analise={d.analise} fechar={voltar} estatico />;
   return <RelatorioDiario obra={d.obra} dataRef={data} cargas={d.cargas} fech={d.fech} fechar={voltar} estatico />;
+}
+
+// ============================================================================
+// RELATÓRIO TÉCNICO DE APLICAÇÃO (obra/pista) — consolidado por trecho
+// ============================================================================
+const mediaDe = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+const desvioDe = (a) => {
+  if (a.length < 2) return null;
+  const m = mediaDe(a);
+  return Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / (a.length - 1));
+};
+
+function consolidarAplicacao(obra, cargas, fechs) {
+  const aplicadas = cargas.filter((c) => c.descarga?.fim);
+  const dias = [...new Set(cargas.map((c) => c.dataRef))].sort();
+  const ton = aplicadas.reduce((s, c) => s + (c.tonelagem || 0), 0);
+  const tApl = aplicadas.map((c) => c.descarga?.tempAplicacao).filter((v) => v != null);
+  const perdas = cargas.map((c) => c.transporte?.perda).filter((v) => v != null);
+  const transp = cargas.map((c) => c.transporte?.minutos).filter((v) => v != null);
+  const descarga = aplicadas.map((c) => minutosEntre(c.descarga?.inicio, c.descarga?.fim)).filter((v) => v != null);
+  const espera = cargas.map((c) => minutosEntre(c.chegada?.hora, c.descarga?.inicio)).filter((v) => v != null && v >= 0);
+  const gcs = fechs.flatMap((f) => (f.ensaios || []).map((r) => num(r.gc)).filter((v) => v != null));
+  const espCamp = fechs.flatMap((f) => (f.ensaios || []).map((r) => num(r.esp)).filter((v) => v != null));
+  const espSolta = aplicadas.map((c) => num(c.descarga?.espessura)).filter((v) => v != null);
+  const imprim = fechs.flatMap((f) => (f.imprimacao || []).map((r) => calcImprim(r, f.imprimCfg)).filter(Boolean));
+  const frias = aplicadas.filter((c) => c.descarga?.tempAplicacao != null && c.descarga.tempAplicacao < LIMITES.tempAplicMin);
+  const gcBaixo = gcs.filter((v) => v < LIMITES.gcMin);
+
+  // Agrupamento por trecho aplicado
+  const trechos = {};
+  aplicadas.forEach((c) => {
+    const k = (c.descarga?.trecho || "Não informado").trim();
+    (trechos[k] ||= { nome: k, cargas: 0, ton: 0, temps: [], esp: [], dias: new Set() });
+    trechos[k].cargas++;
+    trechos[k].ton += c.tonelagem || 0;
+    if (c.descarga?.tempAplicacao != null) trechos[k].temps.push(c.descarga.tempAplicacao);
+    const e = num(c.descarga?.espessura); if (e != null) trechos[k].esp.push(e);
+    trechos[k].dias.add(c.dataRef);
+  });
+
+  return {
+    dias, aplicadas, ton, tApl, perdas, transp, descarga, espera, gcs, espCamp, espSolta, imprim, frias, gcBaixo,
+    trechos: Object.values(trechos).sort((a, b) => b.ton - a.ton),
+    tonDia: dias.length ? ton / dias.length : null,
+  };
+}
+
+function gerarAnaliseAplicacao(obra, d) {
+  const p = [];
+  const espProj = num(obra?.espessuraProjeto);
+  p.push(`A obra ${obra?.nome || ""} registrou aplicação de ${d.ton.toFixed(1)} t de concreto asfáltico em ${d.aplicadas.length} carga(s), distribuídas em ${d.dias.length} dia(s) de execução${d.dias.length ? ` (${fmtBR(d.dias[0])} a ${fmtBR(d.dias[d.dias.length - 1])})` : ""}, com média de ${d.tonDia ? d.tonDia.toFixed(1) : "—"} t por dia de aplicação.`);
+
+  if (d.tApl.length) {
+    p.push(`Temperatura de aplicação: mínima ${Math.min(...d.tApl)} °C, média ${mediaDe(d.tApl).toFixed(1)} °C e máxima ${Math.max(...d.tApl)} °C, para o critério mínimo de ${LIMITES.tempAplicMin} °C. ${d.frias.length ? `${d.frias.length} carga(s) foram registradas abaixo do mínimo: ${d.frias.map((c) => `${c.placa} (${c.descarga.tempAplicacao} °C, ${c.descarga.trecho || "trecho não informado"})`).join("; ")}.` : "Nenhuma carga foi aplicada abaixo do limite registrado."}`);
+  } else p.push("Não há temperaturas de aplicação registradas no período.");
+
+  if (d.perdas.length) {
+    const acima = d.perdas.filter((v) => v > LIMITES.perdaAlerta).length;
+    p.push(`Ciclo logístico: tempo médio entre usina e obra de ${fmtMin(Math.round(mediaDe(d.transp)))}${d.espera.length ? `, espera média para início da descarga de ${fmtMin(Math.round(mediaDe(d.espera)))}` : ""}${d.descarga.length ? ` e duração média de descarga de ${fmtMin(Math.round(mediaDe(d.descarga)))}` : ""}. A perda térmica média no transporte foi de ${mediaDe(d.perdas).toFixed(1)} °C (máxima ${Math.max(...d.perdas)} °C)${acima ? `, com ${acima} ocorrência(s) acima do parâmetro de alerta de ${LIMITES.perdaAlerta} °C` : ""}.`);
+  }
+
+  if (d.gcs.length) {
+    const m = mediaDe(d.gcs), s = desvioDe(d.gcs);
+    p.push(`Compactação: foram executadas ${d.gcs.length} determinação(ões) de grau de compactação, com média de ${m.toFixed(1)}%, mínimo de ${Math.min(...d.gcs).toFixed(1)}% e máximo de ${Math.max(...d.gcs).toFixed(1)}%${s != null ? `, desvio-padrão de ${s.toFixed(2)}%` : ""}, para o critério mínimo de ${LIMITES.gcMin}%. ${d.gcBaixo.length ? `${d.gcBaixo.length} determinação(ões) ficaram abaixo do mínimo.` : `Todas as determinações atenderam ao critério (${d.gcs.length}/${d.gcs.length}).`}`);
+  } else p.push("Não há determinações de grau de compactação registradas no período.");
+
+  if (d.espCamp.length || d.espSolta.length) {
+    const partes = [];
+    if (d.espCamp.length) partes.push(`espessura medida em campo com média de ${mediaDe(d.espCamp).toFixed(2)} cm (mín. ${Math.min(...d.espCamp)} cm, máx. ${Math.max(...d.espCamp)} cm) em ${d.espCamp.length} ponto(s)`);
+    if (d.espSolta.length) partes.push(`espessura solta conferida no gabarito com média de ${mediaDe(d.espSolta).toFixed(2)} cm`);
+    p.push(`Espessura: ${partes.join("; ")}${espProj != null ? `, para espessura de projeto de ${espProj} cm` : ""}.`);
+  }
+
+  if (d.imprim.length) {
+    const taxas = d.imprim.map((x) => x.taxa);
+    const nc = d.imprim.filter((x) => x.sit !== "conforme").length;
+    p.push(`Imprimação/pintura de ligação: ${d.imprim.length} determinação(ões) pelo método da bandeja, taxa média de ${mediaDe(taxas).toFixed(2)} l/m² (mín. ${Math.min(...taxas).toFixed(2)}, máx. ${Math.max(...taxas).toFixed(2)}) para taxa de projeto de ${d.imprim[0].alvo} ± ${d.imprim[0].tol} l/m². ${nc ? `${nc} determinação(ões) fora da tolerância.` : "Todas dentro da tolerância."}`);
+  }
+
+  if (d.trechos.length) {
+    p.push(`Distribuição por trecho: ${d.trechos.map((t) => `${t.nome} — ${t.ton.toFixed(1)} t em ${t.cargas} carga(s)`).join("; ")}.`);
+  }
+
+  p.push("Os valores acima correspondem exclusivamente aos dados medidos e registrados em campo pelo sistema, com autoria e horário auditáveis. Critério adotado conforme projeto e especificação contratual cadastrados.");
+  p.push("Minuta de análise técnica de aplicação gerada automaticamente a partir dos registros. Sujeita a revisão, edição e aprovação do responsável técnico.");
+  return p.join("\n\n");
+}
+
+function eixosAplicacao(obra, d) {
+  const espProj = num(obra?.espessuraProjeto);
+  const espOk = d.espCamp.length && espProj != null ? d.espCamp.every((v) => Math.abs(v - espProj) <= espProj * 0.1) : null;
+  return [
+    ["Temperatura de aplicação", d.tApl.length ? (d.frias.length ? "nao_conforme" : "conforme") : "pendente"],
+    ["Perda térmica no transporte", d.perdas.length ? (d.perdas.filter((v) => v > LIMITES.perdaAlerta).length ? "atencao" : "conforme") : "pendente"],
+    ["Grau de compactação", d.gcs.length ? (d.gcBaixo.length ? "nao_conforme" : "conforme") : "pendente"],
+    ["Espessura da camada", d.espCamp.length ? (espOk === null ? "atencao" : espOk ? "conforme" : "atencao") : "pendente"],
+    ["Imprimação / pintura de ligação", d.imprim.length ? (d.imprim.some((x) => x.sit !== "conforme") ? "nao_conforme" : "conforme") : "pendente"],
+    ["Completude dos registros de pista", d.aplicadas.length && d.gcs.length ? "conforme" : "pendente"],
+  ];
+}
+
+function RelatorioAplicacao({ obra, cargas, fechs, fechar, estatico }) {
+  const d = useMemo(() => consolidarAplicacao(obra, cargas, fechs), [obra?.id, cargas.length, fechs.length]);
+  const [texto, setTexto] = useState("");
+  useEffect(() => { setTexto(gerarAnaliseAplicacao(obra, d)); }, [obra?.id, d]);
+  const espProj = num(obra?.espessuraProjeto);
+  const eixos = eixosAplicacao(obra, d);
+  const numero = `RA-${(obra?.nome || "OB").replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase()}`;
+
+  return (
+    <Impressao fechar={fechar} link={linkRel("aplicacao", obra?.id)} estatico={estatico}>
+      <CabecalhoRel titulo="RELATÓRIO TÉCNICO DE APLICAÇÃO" numero={numero} obra={obra} dataRef={obra?.dataConclusao || hojeISO()} />
+
+      <div style={secRel}>1 · Situação por eixo (execução na pista)</div>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}><tbody>
+        {eixos.map(([nome, s]) => (
+          <tr key={nome}><td style={tabTd}>{nome}</td>
+            <td style={{ ...tabTd, textAlign: "right", fontWeight: 800, color: s !== "pendente" ? SIT[s].cor : C.mut }}>{s !== "pendente" ? SIT[s].rot.toUpperCase() : "PENDENTE"}</td></tr>
+        ))}
+      </tbody></table>
+
+      <div style={secRel}>2 · Produção aplicada</div>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}><tbody>
+        <tr>
+          <td style={tabTd}><b>Período:</b> {d.dias.length ? `${fmtBR(d.dias[0])} → ${fmtBR(d.dias[d.dias.length - 1])}` : "—"}</td>
+          <td style={tabTd}><b>Dias de aplicação:</b> {d.dias.length}</td>
+          <td style={tabTd}><b>Massa aplicada:</b> {d.ton.toFixed(1)} t</td>
+          <td style={tabTd}><b>Cargas aplicadas:</b> {d.aplicadas.length}</td>
+          <td style={tabTd}><b>Média por dia:</b> {d.tonDia ? `${d.tonDia.toFixed(1)} t` : "—"}</td>
+        </tr>
+        <tr>
+          <td style={tabTd}><b>Temp. aplicação (mín/méd/máx):</b> {d.tApl.length ? `${Math.min(...d.tApl)} / ${mediaDe(d.tApl).toFixed(1)} / ${Math.max(...d.tApl)} °C` : "—"}</td>
+          <td style={tabTd}><b>Usina → obra:</b> {d.transp.length ? fmtMin(Math.round(mediaDe(d.transp))) : "—"}</td>
+          <td style={tabTd}><b>Espera p/ descarga:</b> {d.espera.length ? fmtMin(Math.round(mediaDe(d.espera))) : "—"}</td>
+          <td style={tabTd}><b>Duração da descarga:</b> {d.descarga.length ? fmtMin(Math.round(mediaDe(d.descarga))) : "—"}</td>
+          <td style={tabTd}><b>Perda térmica média:</b> {d.perdas.length ? `${mediaDe(d.perdas).toFixed(1)} °C` : "—"}</td>
+        </tr>
+      </tbody></table>
+
+      <div style={secRel}>3 · Desempenho por trecho aplicado</div>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead><tr>{["Trecho / estaca", "Cargas", "Massa (t)", "Dias", "Temp. média aplicação", "Esp. solta média (cm)"].map((h) => <th key={h} style={tabTh}>{h}</th>)}</tr></thead>
+        <tbody>{d.trechos.map((t) => (
+          <tr key={t.nome}>
+            <td style={tabTd}><b>{t.nome}</b></td>
+            <td style={tabTd}>{t.cargas}</td>
+            <td style={tabTd}>{t.ton.toFixed(1)}</td>
+            <td style={tabTd}>{t.dias.size}</td>
+            <td style={{ ...tabTd, fontWeight: 700, color: t.temps.length && mediaDe(t.temps) < LIMITES.tempAplicMin ? C.red : C.ink }}>{t.temps.length ? `${mediaDe(t.temps).toFixed(1)} °C` : "—"}</td>
+            <td style={tabTd}>{t.esp.length ? mediaDe(t.esp).toFixed(2) : "—"}</td>
+          </tr>
+        ))}</tbody>
+      </table>
+
+      <div style={secRel}>4 · Controle de compactação e espessura</div>
+      <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 8 }}><tbody>
+        <tr>
+          <td style={tabTd}><b>Determinações de GC:</b> {d.gcs.length}</td>
+          <td style={tabTd}><b>GC médio:</b> {d.gcs.length ? `${mediaDe(d.gcs).toFixed(1)}%` : "—"}</td>
+          <td style={tabTd}><b>GC mínimo:</b> {d.gcs.length ? `${Math.min(...d.gcs).toFixed(1)}%` : "—"}</td>
+          <td style={tabTd}><b>Desvio-padrão:</b> {desvioDe(d.gcs) != null ? `${desvioDe(d.gcs).toFixed(2)}%` : "—"}</td>
+          <td style={{ ...tabTd, fontWeight: 800, color: d.gcBaixo.length ? C.red : C.ok }}><b>≥ {LIMITES.gcMin}%:</b> {d.gcs.length ? `${d.gcs.length - d.gcBaixo.length}/${d.gcs.length}` : "—"}</td>
+        </tr>
+        <tr>
+          <td style={tabTd}><b>Espessura de projeto:</b> {espProj != null ? `${espProj} cm` : "—"}</td>
+          <td style={tabTd}><b>Esp. medida (média):</b> {d.espCamp.length ? `${mediaDe(d.espCamp).toFixed(2)} cm` : "—"}</td>
+          <td style={tabTd}><b>Esp. mín/máx:</b> {d.espCamp.length ? `${Math.min(...d.espCamp)} / ${Math.max(...d.espCamp)} cm` : "—"}</td>
+          <td style={tabTd}><b>Esp. solta média:</b> {d.espSolta.length ? `${mediaDe(d.espSolta).toFixed(2)} cm` : "—"}</td>
+          <td style={tabTd}><b>Pontos medidos:</b> {d.espCamp.length}</td>
+        </tr>
+      </tbody></table>
+      {d.gcs.length > 0 && (
+        <ChartControle titulo={`Grau de compactação por determinação (mínimo ${LIMITES.gcMin}%)`}
+          pontos={fechs.flatMap((f) => (f.ensaios || []).filter((r) => num(r.gc) != null).map((r) => ({ y: num(r.gc), rot: `${f.dataRef.slice(8, 10)}/${f.dataRef.slice(5, 7)}`, fora: num(r.gc) < LIMITES.gcMin })))}
+          refs={[{ v: LIMITES.gcMin, cor: C.red, rot: `Mínimo ${LIMITES.gcMin}%` }]} />
+      )}
+
+      {d.imprim.length > 0 && (
+        <>
+          <div style={secRel}>5 · Imprimação / pintura de ligação (bandeja)</div>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}><tbody><tr>
+            <td style={tabTd}><b>Determinações:</b> {d.imprim.length}</td>
+            <td style={tabTd}><b>Taxa média:</b> {mediaDe(d.imprim.map((x) => x.taxa)).toFixed(2)} l/m²</td>
+            <td style={tabTd}><b>Taxa de projeto:</b> {d.imprim[0].alvo} ± {d.imprim[0].tol} l/m²</td>
+            <td style={{ ...tabTd, fontWeight: 800, color: d.imprim.some((x) => x.sit !== "conforme") ? C.red : C.ok }}><b>Conformes:</b> {d.imprim.filter((x) => x.sit === "conforme").length}/{d.imprim.length}</td>
+          </tr></tbody></table>
+        </>
+      )}
+
+      {(d.frias.length > 0 || d.gcBaixo.length > 0) && (
+        <>
+          <div style={secRel}>Não conformidades registradas</div>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr>{["Tipo", "Identificação", "Valor medido", "Critério"].map((h) => <th key={h} style={tabTh}>{h}</th>)}</tr></thead>
+            <tbody>
+              {d.frias.map((c) => (
+                <tr key={c.id}><td style={tabTd}>Temperatura de aplicação</td><td style={tabTd}>{c.placa} · {fmtBR(c.dataRef)} · {c.descarga?.trecho || "—"}</td>
+                  <td style={{ ...tabTd, color: C.red, fontWeight: 800 }}>{c.descarga?.tempAplicacao} °C</td><td style={tabTd}>≥ {LIMITES.tempAplicMin} °C</td></tr>
+              ))}
+              {fechs.flatMap((f) => (f.ensaios || []).filter((r) => num(r.gc) != null && num(r.gc) < LIMITES.gcMin).map((r, i) => (
+                <tr key={`${f.dataRef}-${i}`}><td style={tabTd}>Grau de compactação</td><td style={tabTd}>{r.estaca || "—"} · {fmtBR(f.dataRef)}</td>
+                  <td style={{ ...tabTd, color: C.red, fontWeight: 800 }}>{r.gc}%</td><td style={tabTd}>≥ {LIMITES.gcMin}%</td></tr>
+              )))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      <div style={secRel}>Análise técnica de aplicação</div>
+      <div className="nao-imprimir" style={{ marginBottom: 8 }}>
+        <textarea value={texto} onChange={(e) => setTexto(e.target.value)} rows={10}
+          style={{ width: "100%", boxSizing: "border-box", fontFamily: F.body, fontSize: 13.5, padding: 11, borderRadius: 11, border: `1.5px solid ${C.line}`, resize: "vertical" }} />
+        <div style={{ fontSize: 12, color: C.mut, marginTop: 4 }}>Revise e edite o texto antes de exportar — ele é gerado apenas a partir dos dados registrados.</div>
+      </div>
+      <div style={{ fontSize: 11.5, whiteSpace: "pre-wrap", lineHeight: 1.55 }}>{texto}</div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 30, marginTop: 44, breakInside: "avoid" }}>
+        {["Responsável técnico — pista", "Coordenação Solocontrol"].map((r) => (
+          <div key={r} style={{ textAlign: "center" }}><div style={{ borderTop: `1.5px solid ${C.ink}`, paddingTop: 5, fontSize: 11 }}>{r}</div></div>
+        ))}
+      </div>
+      <div style={{ fontSize: 9.5, color: C.mut, marginTop: 18, borderTop: `1px solid ${C.line}`, paddingTop: 6 }}>
+        Documento gerado pelo sistema Solocontrol em {fmtDataHora()} · Nº {numero} · Consolida {cargas.length} carga(s) e {fechs.length} fechamento(s) diário(s) com registros auditáveis.
+      </div>
+    </Impressao>
+  );
 }
